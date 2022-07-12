@@ -1,0 +1,1452 @@
+---
+title: "Data from: Natural and experimental cold exposure in adulthood increase the sensitivity to future stressors in a free-living songbird"
+author: 
+ - Maren N. Vitousek
+ - Jennifer L. Houtz
+ - Monique A. Pipkin
+ - David A. Chang van Oordt
+ - Kelly K. Hallinger
+ - Jennifer J. Uehling
+ - Cedric Zimmer
+ - Conor C. Taff
+header-includes:
+  - \usepackage[font={footnotesize}, labelfont={bf}]{caption}
+fontsize: 12pt
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    theme: cerulean
+    code_folding: hide
+  bookdown::word_document2:
+      number_sections: FALSE
+      toc: FALSE
+      extra_dependcies: ["flafter"]
+  bookdown::pdf_document2:
+      number_sections: FALSE
+      toc: FALSE
+      extra_dependencies: ["flafter"]
+  bookdown::html_document2:
+      number_sections: FALSE
+      toc: TRUE
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+## Load packages ----
+    pacman::p_load(tidyverse, here, plyr, sjPlot, lme4, lmerTest, ggpubr, rnoaa, lubridate, DHARMa, MASS, rethinking, splines, MuMIn, mgcv, tidymv)
+```
+
+# Data processing
+
+## Process the capture data
+
+The raw capture data is loaded and processed as described in the manuscript. The basic processing steps are:  
+- retain all first capture records (these are all pre-treatment)  
+- for second and third captures, remove any that occur after manipulative experiments (cort dosing, predators, taping)  
+- subset to captures where we actually have at least one cort measure  
+- some cleanup for erroneous values and data wrangling (not changing any data or subsetting here)
+- in the end, this results in the inclusion of 1428 rows for baseline, 1307 rows for stress-induced, and 1238 rows for dex
+
+```{r load-data, message = FALSE, warning = FALSE}
+## Load data ----
+  # Load data for each birds capture
+      db <- read.delim(here::here("1_raw_data/data_by_capture.txt"))
+      # Subset to non invasive experiments
+        db <- subset(db, db$ok_for_weather == "yes")
+      # subset to females
+        db <- subset(db, db$sex == "F")
+        
+  # add in capture hour column
+      # Capture hour
+        db$cap_hr <- round(db$cap_time / 60, 0)
+        
+  # fix some cort values being in different columns and correct some values for extraction efficiency
+            for(i in 1:nrow(db)){
+              if(is.na(db$cort1_correct[i]) == TRUE){
+                if(is.na(db$cort1_raw[i]) == FALSE){db$cort1_correct[i] <- db$cort1_raw[i] * (100/85)}
+              }
+              if(is.na(db$cort2_correct[i]) == TRUE){
+                if(is.na(db$cort1_raw[i]) == FALSE){db$cort2_correct[i] <- db$cort2_raw[i] * (100/85)}
+              }
+              if(is.na(db$cort3_correct[i]) == TRUE){
+                if(is.na(db$cort1_raw[i]) == FALSE){db$cort3_correct[i] <- db$cort3_raw[i] * (100/85)}
+              }
+            }
+        
+  # subset to captures where we have at least one cort measurement      
+        db <- subset(db, db$cort1_correct > 0 | db$cort2_correct > 0 | db$cort3_correct > 0)
+        db_save <- db # saving unmodified version here
+```
+
+## Process the weather data
+
+I'm using hourly weather data from the game farm road weather station accessed with from the Northeast Regional Climate Center. The file includes records from January 1983 to July 2020. Some basic filtering is done to remove very high or low values for temperature or time (these are likely either error codes like '999' or actual data errors). I did a bunch of descriptive plots just to look for mistakes in the data. This represents 38 years of weather data. The raw data should be accessed from the Northeast Climate Center directly, but the repository includes the code here to illustrate the processing along with the capture data after summarized weather data has been merged.
+
+```{r load-weather, message = FALSE, warning = FALSE}
+  # Load weather data
+      dw <- read.delim(here::here("1_raw_data/Input_Weather_Data.txt"))      ## NEED TO ACCESS DATA FROM NORTHEAST CLIMATE CENTER
+    
+      # Subset missing data values or errors
+        dw <- subset(dw, dw$avg_temp_C < 200 & dw$hour < 25 & dw$avg_temp_C > -100)
+        
+  # filter to daytime
+        dw_day <- dw %>% filter(hour > 5, hour < 21)
+        dw_day <- dw_day %>% filter(doy > 90 & doy < 215)
+        
+  # this has the daytime average temperature for every year day combo to be used later for calculating expected temperature      
+        dw_day_mu <- dw_day %>%
+          group_by(year, doy) %>%
+          dplyr::summarise(av_temp_C = mean(avg_temp_C, na.rm = TRUE), n_records = n(), hi_temp_C = max(avg_temp_C, na.rm = TRUE))
+        dw_day_mu$avg_temp_C <- dw_day_mu$av_temp_C
+
+```
+
+## Merge capture and weather data
+
+Joining the capture records to weather data. First I'm matching weather for the sliding window analysis using only the actual weather (not long term expectations). The code is below, but the basic process is:  
+
+- loop through each capture record  
+- subset out temperature records from daytime (6am to 8pm)  
+- subset to the date range; date ranges start 1-30 days before capture and extend from 1 day long up to the day of capture. For starting 30 days before capture there are 30 date ranges that are 1, 2, 3...29, 30 days long. 
+- calculate the mean temperature for the subset window and add it to the capture data frame  
+
+- We decided to limit this range to 7 days for base and stress and 21 days for dex, since I already had the code written I'm still calculating all of them, but I've clipped it down to just those ranges.
+
+Next, expected temperatures in a separate loop, but only for the time periods we identified in the sliding window analysis
+
+```{r merge-weather, message = FALSE, warning = FALSE}
+# ## Add weather data to each capture
+#   # Creating a list of labels for each time period that weather will be calculated for
+    lab_cols <- paste("tb", seq(1, 30, 1), sep = "_")
+    for(i in 1:30){
+      lab_cols2 <- paste(lab_cols[i:30], rep(i, 31 - i), sep = "_")
+      if(i == 1){lab_cols3 <- lab_cols2}
+      if(i > 1){lab_cols3 <- c(lab_cols3, lab_cols2)}
+    }
+# 
+#     dblist <- as.list(NA)
+#     dblist_ex <- as.list(NA)
+#     dblist_sd <- as.list(NA)
+# 
+#   # Looping through every capture record
+#     for(i in 1:nrow(db)){
+#       # Creating subsets for different time periods that were predefined before we switched to sliding window
+#             sub <- subset(dw, dw$year == db$year[i])
+#             sub1 <- subset(sub, sub$doy == db$cap_doy[i] & sub$hour < db$cap_hr[i] + 1 & sub$hour > db$cap_hr[i] - 3)
+#             sub1b <- subset(sub, sub$doy == db$cap_doy[i] & sub$hour < 9 & sub$hour > 5)
+#             sub2a <- subset(sub, sub$doy == db$cap_doy[i] | sub$doy == db$cap_doy[i] - 1)
+#             sub2 <- subset(sub2a, sub2a$hour > 21 | sub2a$hour < 6)
+#             sub3 <- subset(sub, sub$doy == db$cap_doy[i] - 1 & sub$hour > 5 & sub$hour < 21)
+#             sub4 <- subset(sub, sub$doy < db$cap_doy[i] & sub$doy > db$cap_doy[i] - 4 & sub$hour > 5 & sub$hour < 21)
+#             sub5 <- subset(sub, sub$doy < db$cap_doy[i] & sub$doy > db$cap_doy[i] - 8 & sub$hour > 5 & sub$hour < 21)
+#             sub6 <- subset(sub, sub$doy < db$cap_doy[i] - 3 & sub$doy > db$cap_doy[i] - 7 & sub$hour > 5 & sub$hour < 21)
+#             sub7 <- subset(sub, sub$doy < db$cap_doy[i] - 6 & sub$doy > db$cap_doy[i] - 10 & sub$hour > 5 & sub$hour < 21)
+#             sub8 <- subset(sub, sub$doy < db$cap_doy[i] - 9 & sub$doy > db$cap_doy[i] - 13 & sub$hour > 5 & sub$hour < 21)
+#             sub9 <- subset(sub, sub$doy < db$cap_doy[i] - 12 & sub$doy > db$cap_doy[i] - 26 & sub$hour > 5 & sub$hour < 21)
+#             sub10 <- subset(sub, sub$doy < db$cap_doy[i] - 7 & sub$doy > db$cap_doy[i] - 9 & sub$hour > 5 & sub$hour < 21)
+#             sub11 <- subset(sub, sub$doy == db$cap_doy[i] & sub$hour > 5 & sub$hour < 21)
+# 
+#       # Adding the predefined temperature records
+#             db$t_3cap_av[i] <- mean(na.omit(sub1$avg_temp_C))
+#             db$t_m_av[i] <- mean(na.omit(sub1b$avg_temp_C))
+#             db$t_nb_av[i] <- mean(na.omit(sub2$avg_temp_C))
+#             db$t_nb_lo[i] <- min(na.omit(sub2$avg_temp_C))
+#             db$t_db_av[i] <- mean(na.omit(sub3$avg_temp_C))
+#             db$t_db_hi[i] <- max(na.omit(sub3$avg_temp_C))
+#             db$t_3b_av[i] <- mean(na.omit(sub4$avg_temp_C))
+#             db$t_3b_hi[i] <- max(na.omit(sub4$avg_temp_C))
+#             db$t_7b_av[i] <- mean(na.omit(sub5$avg_temp_C))
+#             db$t_7b_hi[i] <- max(na.omit(sub5$avg_temp_C))
+#             db$t_4to6_av[i] <- mean(na.omit(sub6$avg_temp_C))
+#             db$t_7to9_av[i] <- mean(na.omit(sub7$avg_temp_C))
+#             db$t_10to12_av[i] <- mean(na.omit(sub8$avg_temp_C))
+#             db$t_13to25_av[i] <- mean(na.omit(sub9$avg_temp_C))
+#             db$t_7_av[i] <- mean(na.omit(sub10$avg_temp_C))
+#             db$min_cap_day[i] <- min(na.omit(sub11$avg_temp_C))
+# 
+#       # Nested loop that is calculating the sliding window temperature records. These are stored in their own object.
+#           # Right now it records daytime temperature for each day starting 1-30 days ago and with the averaging period
+#             # extending from 1 day up through the day of capture.
+#             subx <- subset(sub, sub$hour > 5 & sub$hour < 21)
+#             subxs <- subx %>%
+#               group_by(doy) %>%
+#               dplyr::summarise(avg_temp_C = mean(avg_temp_C, na.rm = TRUE), max_temp_C = max(avg_temp_C, na.rm = TRUE))
+#             ss1 <- subxs[which(subxs$doy == db$cap_doy[i] - 1):which(subxs$doy == db$cap_doy[i] - 30), "avg_temp_C"]
+#             ss2 <- rep(NA, 465)
+#             ss2[1:30] <- ss1$avg_temp_C
+#             counter <- 31
+#             for(t in 1:29){
+#               if(t == 1){
+#                 ss1x <- data.frame(V1 = ss1$avg_temp_C, V2 = c(ss1$avg_temp_C[(1+t):30], rep(NA, t)))
+#               }
+#               if(t > 1){
+#                 ss1x[, t+1] <- c(ss1$avg_temp_C[(1+t):30], rep(NA, t))
+#               }
+#             }
+#             for(t in 1:29){
+#               ss1x2 <- ss1x[1:(30-t), 1:(t + 1)]
+#               ss2[counter:(counter + 29 - t)] <- rowMeans(ss1x2, na.rm = TRUE)
+#               counter <- counter + 30 - t
+#             }
+# 
+#             dblist[[i]] <- ss2
+# 
+#             print(paste0(i, " of ", nrow(db)))
+#             
+#         # Nested loop similar to above but calculating offset from expected NEEDS WORK
+#             dw_day_xs <- dw_day_mu %>%
+#               group_by(doy) %>%
+#               dplyr::summarise(avg_temp_C2 = mean(avg_temp_C, na.rm = TRUE), avg_temp_sd = sd(avg_temp_C, na.rm = TRUE), n = n())
+#             ss1_ex <- dw_day_xs[which(dw_day_xs$doy == db$cap_doy[i] - 1):which(dw_day_xs$doy == db$cap_doy[i] - 30), "avg_temp_C2"]
+#             ss1_sd <- dw_day_xs[which(dw_day_xs$doy == db$cap_doy[i] - 1):which(dw_day_xs$doy == db$cap_doy[i] - 30), "avg_temp_sd"]
+#             ss2_ex <- rep(NA, 465)
+#             ss2_sd <- rep(NA, 465)
+#             ss2_ex[1:30] <- ss1_ex$avg_temp_C2
+#             ss2_sd[1:30] <- ss1_sd$avg_temp_sd
+#           
+#         # Loop for expected average temperature for the date range      
+#             counter <- 31
+#             for(t in 1:29){
+#               if(t == 1){
+#                 ss1x_ex <- data.frame(V1 = ss1_ex$avg_temp_C2, V2 = c(ss1_ex$avg_temp_C2[(1+t):30], rep(NA, t)))
+#               }
+#               if(t > 1){
+#                 ss1x_ex[, t+1] <- c(ss1_ex$avg_temp_C2[(1+t):30], rep(NA, t))
+#               }
+#             }
+#             for(t in 1:29){
+#               ss1x2_ex <- ss1x_ex[1:(30-t), 1:(t + 1)]
+#               ss2_ex[counter:(counter + 29 - t)] <- rowMeans(ss1x2_ex, na.rm = TRUE)
+#               counter <- counter + 30 - t
+#             }
+# 
+#             dblist_ex[[i]] <- ss2_ex
+#             
+#         # Loop for expected standard deviation for the date range
+#             counter <- 31
+#             for(t in 1:29){
+#               if(t == 1){
+#                 ss1x_sd <- data.frame(V1 = ss1_sd$avg_temp_sd, V2 = c(ss1_sd$avg_temp_sd[(1+t):30], rep(NA, t)))
+#               }
+#               if(t > 1){
+#                 ss1x_sd[, t+1] <- c(ss1_sd$avg_temp_sd[(1+t):30], rep(NA, t))
+#               }
+#             }
+#             for(t in 1:29){
+#               ss1x2_sd <- ss1x_sd[1:(30-t), 1:(t + 1)]
+#               ss2_sd[counter:(counter + 29 - t)] <- rowMeans(ss1x2_sd, na.rm = TRUE)
+#               counter <- counter + 30 - t
+#             }
+# 
+#             dblist_sd[[i]] <- ss2_sd
+#             
+#     }
+# 
+#     # adding the object with the sliding window temperatures back to the breeding records
+#         db[, lab_cols3] <- NA
+#         db_dev <- db
+#         for(i in 1:nrow(db)){
+#           db[i, 52:516] <- dblist[[i]]
+#         }
+#     
+#     # adding the deviations instead, keeping this as a separate object for now
+#         db_dev[, lab_cols3] <- NA
+        # db_deviation <- as.list(NA)
+        # for(i in 1:length(dblist)){
+        #   db_deviation[[i]] <- (dblist[[i]] - dblist_ex[[i]])
+        #        #/ dblist_sd[[i]]
+        # }
+        # for(i in 1:nrow(db_dev)){
+        #   db_dev[i, 52:516] <- db_deviation[[i]]
+        # }
+#           
+
+    # Add in expected deviation for day of capture (separate from the other loop above)
+      #   sub1 <- subset(dw, dw$hour > 5 & dw$hour < 9)
+      #   sub2 <- sub1 %>%
+      #     group_by(year, doy) %>%
+      #     dplyr::summarise(t_m_av = mean(avg_temp_C))
+      # for(u in 1:nrow(db_dev)){
+      #   sub3 <- subset(sub2, sub2$doy == db_dev$cap_doy[u])
+      #   db_dev$t_m_av[u] <- (db_dev$t_m_av[u] - mean(sub3$t_m_av)) / sd(sub3$t_m_av)
+      # }
+
+# 
+#     ## Fix some inf values
+#       db$t_nb_lo[which(!is.finite(db$t_nb_lo))] <- NA
+#       db_dev$t_nb_lo[which(!is.finite(db_dev$t_nb_lo))] <- NA
+
+    # the loop above takes a while to run so I've saved the output and reloaded it here. Should be run again if any changes are needed.
+      #saveRDS(db, file = here::here("2_modified_data", "weather_cort.rds"))
+      #saveRDS(db_dev, file = here::here("2_modified_data", "weather_cort_ex.rds"))
+      db <- readRDS(here::here("2_modified_data", "weather_cort.rds"))
+      db_dev <- readRDS(here::here("2_modified_data", "weather_cort_ex.rds"))
+      
+    # ## Log transform 
+       db$cort1_correct <- log(db$cort1_correct)
+       db$cort2_correct <- log(db$cort2_correct)
+       db$cort3_correct <- log(db$cort3_correct)
+       db_dev$cort1_correct <- log(db_dev$cort1_correct)
+       db_dev$cort2_correct <- log(db_dev$cort2_correct)
+       db_dev$cort3_correct <- log(db_dev$cort3_correct)
+      
+    ## Separate data for base, stress, and dex
+      base_af <- subset(db, db$type1 == "B" & is.na(db$type1) == FALSE)
+      stress_af <- subset(db, db$type2 == "S" & is.na(db$type2) == FALSE & is.na(db$type1) == FALSE)
+      dex_af <- subset(db, db$type3 == "D" & is.na(db$type3) == FALSE & is.na(db$type2) == FALSE)
+      
+    ## Separate data for base, stress, and dex
+      base_af_ex <- subset(db_dev, db_dev$type1 == "B" & is.na(db_dev$type1) == FALSE)
+      stress_af_ex <- subset(db_dev, db_dev$type2 == "S" & is.na(db_dev$type2) == FALSE & is.na(db_dev$type1) == FALSE)
+      dex_af_ex <- subset(db_dev, db_dev$type3 == "D" & is.na(db_dev$type3) == FALSE & is.na(db_dev$type2) == FALSE)  
+```
+
+
+## Descriptive plots, sample sizes, etc.
+
+Here I'm just making a few plots and summaries that might be useful for describing the dataset before doing actual analyses.
+
+```{r obs-weather, message = FALSE, warning = FALSE, fig.height = 7.7, fig.width = 4.8, fig.cap = "Distribution of capture dates and distribution of average daytime temperatures on each day of the year. Red points are individual days and blue line is the average over 38 years."}
+
+p1 <- ggplot(data = dw_day_mu, mapping = aes(x = doy, y = avg_temp_C)) + 
+      geom_point(alpha = 0.2, color = "coral3") + 
+      geom_smooth(fill = "slateblue", color = "slateblue") +
+      theme_bw() +
+      theme(panel.grid.minor = element_blank(), panel.grid.major = element_blank()) +
+      theme(axis.text = element_text(size = 12), axis.title = element_text(size = 16)) +
+      ylab("Average daytime temperature \u00B0C") +
+      xlab("Day of year") +
+      coord_cartesian(xlim = c(135, 185), ylim = c(4, 32)) +
+      annotate(geom = "text", x = -Inf, y = Inf, hjust = -.5, vjust = 1.5, label = "B", size = 6)
+      
+p2 <- ggplot(data = db, mapping = aes(x = cap_doy)) +
+      geom_histogram(binwidth = 1, fill = "gray25", alpha = 0.4, color = "black") +
+      theme_bw() +
+      theme(panel.grid.minor = element_blank(), panel.grid.major = element_blank()) +
+      theme(axis.text = element_text(size = 12), axis.title = element_text(size = 16)) +
+      ylab("Number of captures") +
+      xlab("") +
+      coord_cartesian(xlim = c(135, 185)) +
+      annotate(geom = "text", x = -Inf, y = Inf, hjust = -.5, vjust = 1.5, label = "A", size = 6)
+  
+ggpubr::ggarrange(p2, p1, nrow = 2, heights = c(1, 1.5))
+```
+
+After the filtering described above, there are a total of 1429 captures included from a total of 719 unique females. There are 892 unique female-year combinations (females caught in different years). Reporting on just the three sample types, there are 1428 separate baseline measurements, 1307 separate stress measurements (these all have matched base measures), and 1238 separate dex measurements (these all have paired stress measures). That means there are a total of 3973 separate corticosterone measurements included. For models fit later on I will need to restrict to records with no missing data (in fixed or random effects) so the sample sizes might differ a bit from the full dataset here.
+
+Here is the distribution by year:
+
+```{r year-obs, fig.height = 5.5, fig.width = 5.5}
+ggplot(db, mapping = aes(x = cap_doy)) + 
+  geom_histogram(binwidth = 1) + 
+  facet_wrap(~as.factor(year)) +
+  theme_bw() +
+  xlab("Capture day of year") +
+  ylab("Number of captures")
+```
+
+## Correlation between date and temperature
+
+This is calculating the correlation between day of year and daytime average temperature. Only days where a capture happened are included and if multiple captures happened on a given day the datapoint is only counted once. The simple pairwise correlation and p-value are printed below.
+
+```{r doy-cor, message = FALSE, warning = FALSE}
+doycor <- base_af %>%
+  dplyr::group_by(year, cap_doy) %>%
+  dplyr::summarise(n = n(), temperature = mean(t_db_av))
+
+#cor(doycor$cap_doy, doycor$temperature)
+cor.test(doycor$cap_doy, doycor$temperature)
+```
+
+
+# Analyses
+
+## 1. Does ambient temperature causally affect corticosterone levels
+
+This is from the cold snap experiment in 2021 where nests were either cooled with ice packs or controls. 
+
+Description of sampling: females had ice packs in their nest or control packs starting on morning of the 4th day after hatching. Ice packs were swapped at 6/9/12/3/6 each day. Females were captured early in morning on day 7 after hatching and three blood samples were taken at randomly selected time points close to 0/5/10/20/30/60 minutes. 
+
+Models are fit as a GAMM and tables here are for the GAMM and the linear part of the GAMM with the random effect.
+
+Figures are produced using the raw data and the GAMM fit.
+
+```{r cold-exp, warning = FALSE, message = FALSE, fig.width = 8, fig.height = 4}
+d_exp <- read.delim(here::here("1_raw_data/cold_snap_adult.txt"))
+
+d_exp1 <- subset(d_exp, d_exp$cap_num == 1)
+d_exp1$type <- as.factor(d_exp1$type)
+d_exp1$type <- relevel(d_exp1$type, ref = "S")
+d_exp1$type <- relevel(d_exp1$type, ref = "B")
+p_exp1 <- ggplot(data = d_exp1, mapping = aes(x = type, y = final_cort, color = treatment, fill = treatment)) +
+  geom_boxplot(alpha = 0.4) +
+  #geom_point() +
+  scale_color_manual(values = c("slateblue", "orange")) +
+  scale_fill_manual(values = c("slateblue", "orange")) +
+  xlab("Sample type") + 
+  ylab("Corticosterone (ng/ml)") +
+  theme_bw() +
+  theme(legend.position = c(0.8, 0.8), axis.title = element_text(size = 12)) +
+  coord_cartesian(ylim = c(0, 110))
+
+
+d_exp2 <- subset(d_exp, d_exp$cap_num == 2)
+d_exp2$treatment2 <- "cooled"
+for(i in 1:nrow(d_exp2)){
+  if(d_exp2$treatment[i] == "Cold_Control"){d_exp2$treatment2[i] <- "control"}
+}
+d_exp2$treatment2 <- factor(d_exp2$treatment2, levels = c("cooled", "control"))
+p_exp2 <- ggplot(data = d_exp2, mapping = aes(x = latency / 60, y = final_cort, color = treatment2, fill = treatment2)) +
+  geom_point(alpha = 0.6) +
+  geom_smooth(method = "gam") +
+  scale_color_manual(values = c("slateblue", "orange")) +
+  scale_fill_manual(values = c("slateblue", "orange")) +
+  theme_bw() +
+  theme(panel.grid.minor = element_blank(), panel.grid.major = element_blank(),
+        legend.title = element_blank(), legend.text = element_text(size = 14),
+        axis.title = element_text(size = 14), axis.text = element_text(size = 12)) +
+  annotate(geom = "text", x = -Inf, y = Inf, hjust = -.5, vjust = 1.5, label = "B", size = 6) +
+  xlab("Sampling latency (minutes)") +
+  ylab("Corticosterone (ng/ml)") +
+  theme(legend.position = c(0.75, 0.8)) +
+  coord_cartesian(ylim = c(0, 110))
+
+#ggpubr::ggarrange(p1, p2)
+
+d_exp2$lat_min <- d_exp2$latency/60
+m_cold <- lmer(final_cort ~ lat_min + I(lat_min^2) + I(lat_min^3) + treatment + (1|band), data = d_exp2)
+d_exp2$trt3 <- factor(d_exp2$treatment2, ordered = FALSE)
+m_cold2 <- gam(final_cort ~ trt3 + s(lat_min, by = trt3, k = -1), data = d_exp2)
+m_cold2b <- gam(final_cort ~ trt3 + s(lat_min, by = trt3, k = -1) + s(band, bs = "re"), data = d_exp2)
+m_cold2c <- gamm(final_cort ~ trt3 + s(lat_min, by = trt3, k = -1), data = d_exp2, random = list(band = ~1))
+
+tab_model(m_cold2c$gam)
+summary(m_cold2c$lme)
+
+# plot(m_cold2, seWithMean = TRUE, shift = coef(m_cold2)[1], residuals = TRUE, rug = FALSE)
+
+m_cold2p <- predict_gam(m_cold2c$gam)
+# m_cold2p %>%
+#   ggplot(aes(x = lat_min, y = fit)) +
+#   geom_smooth_ci(trt3)
+
+
+# function to compare differences in smooths
+# from here:https://fromthebottomoftheheap.net/2017/10/10/difference-splines-i/
+
+smooth_diff <- function(model, newdata, f1, f2, var, alpha = 0.05,
+                        unconditional = FALSE) {
+    xp <- predict(model, newdata = newdata, type = 'lpmatrix')
+    c1 <- grepl(f1, colnames(xp))
+    c2 <- grepl(f2, colnames(xp))
+    r1 <- newdata[[var]] == f1
+    r2 <- newdata[[var]] == f2
+    ## difference rows of xp for data from comparison
+    X <- xp[r1, ] - xp[r2, ]
+    ## zero out cols of X related to splines for other lochs
+    X[, ! (c1 | c2)] <- 0
+    ## zero out the parametric cols
+    X[, !grepl('^s\\(', colnames(xp))] <- 0
+    dif <- X %*% coef(model)
+    se <- sqrt(rowSums((X %*% vcov(model, unconditional = unconditional)) * X))
+    crit <- qt(alpha/2, df.residual(model), lower.tail = FALSE)
+    upr <- dif + (crit * se)
+    lwr <- dif - (crit * se)
+    data.frame(pair = paste(f1, f2, sep = '-'),
+               diff = dif,
+               se = se,
+               upper = upr,
+               lower = lwr)
+}
+
+# make new simulated data from fit model
+pdat <- expand.grid(lat_min = seq(0, 60, by = 1),
+                    trt3 = c("cooled", "control"))
+xp <- predict(m_cold2c$gam, newdata = pdat, type = 'lpmatrix')
+
+xp2 <- predict(m_cold2c$gam, newdata = pdat)
+xp3 <- data.frame(lat_min = pdat$lat_min, trt3 = pdat$trt3, pred = xp2)
+
+comp1 <- smooth_diff(m_cold2c$gam, pdat, "cooled", "control", "trt3")
+
+# the comparison above doesn't account for the parametric estimate of overall group differences
+# between cooled and control in the gam. I'm adding it in manually here.
+
+comp1$diff <- comp1$diff + 10.51
+comp1$upper <- comp1$upper + 10.51
+comp1$lower <- comp1$lower + 10.51
+
+comp1$lat_min <- seq(0, 60, by = 1)
+
+p_exp3 <- ggplot(comp1, mapping = aes(x = lat_min, y = diff)) +
+  geom_ribbon(aes(ymin = lower, ymax = upper), alpha = 0.2) +
+  geom_line() +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  theme_bw() +
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank()) +
+  ylab("Difference in corticosterone") +
+  xlab("Sampling latency (minutes)") +
+  coord_cartesian(ylim = c(-20, 40)) +
+  theme(axis.title = element_text(size = 14), axis.text = element_text(size = 12)) +
+  annotate(geom = "text", x = -Inf, y = Inf, hjust = -.5, vjust = 1.5, label = "C", size = 6) +
+  annotate(geom = "text", x = 30, y = 34, label = "Cooled corticosterone higher", color = "slateblue", size = 4) +
+  annotate(geom = "text", x = 30, y = -18, label = "Control corticosterone higher", color = "#CC8400", size = 4)
+
+```
+
+
+```{r pend-hobo, warning = FALSE, message = FALSE, fig.height = 3, fig.width = 9}
+# read in and combine all raw hobo data
+    l <- list.files(here::here("raw_hobo"))
+    
+    hobo_dat <- data.frame(unit = NA, box = NA, date = NA)
+    
+    for(i in 1:length(l)){
+      lt <- read.csv(here::here("raw_hobo", l[i]))
+      lt <- lt[, 2:3]
+      colnames(lt) <- c("date", "temp")
+      lt$date <- as.POSIXct(lt$date, format = "%m/%d/%Y %H:%M:%S")
+      u <- strsplit(l[i], split = "_")[[1]][1]
+      b <- strsplit(strsplit(l[i], split = "_")[[1]][2], split = " ")[[1]][[1]]
+      lt$unit <- rep(u, nrow(lt))
+      lt$box <- rep(b, nrow(lt))
+      if(i == 1){hobo_dat <- lt}
+      if(i > 1){hobo_dat <- rbind(hobo_dat, lt)}
+    }
+    
+    hobo_dat$yday <- yday(hobo_dat$date)
+    hobo_dat$minute <- minute(hobo_dat$date) + 60 * hour(hobo_dat$date)
+    hobo_dat$min_2 <- hobo_dat$minute + hobo_dat$yday * 24 * 60
+    hobo_dat$ubox <- paste(hobo_dat$unit, hobo_dat$box, sep = "_")
+
+# read in timing of cold snap data
+  s <- read.delim(here::here("1_raw_data", "snaps.txt"))
+  s$start <- as.POSIXct(s$start, format = "%m/%d/%y %H:%M") 
+  s$end <- as.POSIXct(s$end, format = "%m/%d/%y %H:%M")
+  s$start2 <- as.POSIXct(s$start2, format = "%m/%d/%y %H:%M") 
+  s$end2 <- as.POSIXct(s$end2, format = "%m/%d/%y %H:%M") 
+
+# join hobo and snap data
+  hs <- plyr::join(hobo_dat, s, "ubox", "left", "first")
+  hs <- subset(hs, hs$experiment == "cold_snap")
+  
+# loop through hobo and characterize
+  hs <- subset(hs, hs$yday >= hs$pend_in & hs$yday <= hs$pend_out)
+  
+  hs$sn1a <- hs$date - hs$start
+  hs$sn1b <- hs$date - hs$end
+  
+  hs2 <- subset(hs, hs$sn1a > 0 & hs$sn1b < 0)
+  hs2 <- subset(hs2, hs2$experiment == "cold_snap")  
+  
+  hs2$treatment <- gsub("Cold", "Cooled", hs2$treatment)
+  p_hobo <- ggplot(data = hs2, mapping = aes(y = temp, x = treatment, color = treatment, fill = treatment)) +
+    #geom_jitter(width = 0.15, alpha = 0.9) +
+    #geom_boxplot(outlier.shape = NA, alpha = 0.7) + 
+    geom_violin(alpha = 0.7) +
+    theme_bw() +
+    guides(fill = "none", color = "none") +
+    ylab("Temperature \u00b0C") +
+    xlab("") +
+    theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+          axis.text.y = element_text(size = 12), axis.title = element_text(size = 14),
+          axis.text.x = element_text(size = 12)) +
+    geom_point(alpha = 0) +
+    stat_summary(fun.data = mean_sd, geom = "pointrange", color = "black", na.rm = TRUE) +
+    theme(legend.position = "top") +
+    scale_fill_manual(values = c("orange", "slateblue")) +
+    scale_color_manual(values = c("orange", "slateblue")) +
+    annotate(geom = "text", x = -Inf, y = Inf, hjust = -.5, vjust = 1.5, label = "A", size = 6)
+  
+  
+  #p_hobo2 <- ggExtra::ggMarginal(p_hobo, type = 'density', groupFill = TRUE)  
+  #ggpubr::ggarrange(p_hobo, p_exp2, p_exp3, nrow = 1)
+    
+  # hs2$min_5 <- round(hs2$min_2, digits = -1)
+  # hs3 <- hs2 %>%
+  #   dplyr::group_by(treatment, min_5) %>%
+  #   dplyr::summarise(n = n(), temperature = mean(temp)) %>%
+  #   pivot_wider(id_cols = min_5, names_from = treatment, values_from = c(temperature, n))
+  # 
+  # hs3$dif <- hs3$temperature_Cold - hs3$temperature_Control
+  # 
+  # ggplot(hs3, mapping = aes(x = temperature_Control, y = dif)) +
+  #   geom_point(alpha = 0.5) +
+  #   geom_smooth(method = "gam")
+  
+  cowplot::plot_grid(p_hobo, p_exp2, p_exp3, nrow = 1)
+    
+```
+
+
+## 2. How and over what timeline does temperature affect natural variation in corticosterone regulation?
+
+For each of basecort, stresscort, and dex I'm fitting a series of sliding window analyses. The full model is identical in every grid except for the choice of temperature time window. Models are general linear mixed models fit with `lme4` package like this:
+
+> `base ~ stage*temperature + (1|ID) + (1|year)`
+> `induced ~ stage*temperature + base + (1|ID) + (1|year)`
+> `dex ~ stage*temperature + induced + (1|ID) + (1|year)`
+
+### 2.1 Base Corticosterone
+
+```{r base-heat, fig.height = 4, fig.width = 8, warning = FALSE, message = FALSE, fig.cap = "sliding windows for base cort"}
+### Basecort heatmap
+      
+    save_bi <- data.frame(pred = c(lab_cols3, NA), pred_est = NA, ci_lo = NA, ci_hi = NA)  
+    save_bp <- data.frame(pred = c(lab_cols3, NA), pred_est = NA, ci_lo = NA, ci_hi = NA)
+    for(i in 1:466){
+      if(i < 466){
+        dbt <- subset(base_af, base_af$stage == "incubation" | base_af$stage == "provisioning")
+        dbt$pred <- dbt[, i + 51]
+        mbt <- lmer(scale(cort1_correct) ~ scale(pred)*stage + (1|band) + (1|year),
+             data = dbt)
+        save_bi$pred_est[i] <- fixef(mbt)[2]
+        save_bp$pred_est[i] <- fixef(mbt)[2] + fixef(mbt)[4]
+        #print(i)
+      }
+      if(i == 466){
+        dbt <- subset(base_af, base_af$stage == "incubation" | base_af$stage == "provisioning")
+        dbt$pred <- dbt$t_m_av
+        mbt <- lmer(scale(cort1_correct) ~ scale(pred)*stage + (1|band) + (1|year),
+             data = dbt)
+        save_bi$pred_est[i] <- fixef(mbt)[2]
+        save_bp$pred_est[i] <- fixef(mbt)[2] + fixef(mbt)[4]
+        #print(i)
+      }
+      if(i < 466){
+        if(str_split(lab_cols3[i], "_")[[1]][2] == str_split(lab_cols3[i], "_")[[1]][3]){
+        post <- mvrnorm(n = 1000, mu = fixef(mbt), Sigma = vcov(mbt))
+        
+        save_bi$ci_lo[i] <- HPDI(post[, 2], prob = 0.95)[1]
+        save_bi$ci_hi[i] <- HPDI(post[, 2], prob = 0.95)[2]
+        save_bp$ci_lo[i] <- HPDI(post[, 2] + post[, 4], prob = 0.95)[1]
+        save_bp$ci_hi[i] <- HPDI(post[, 2] + post[, 4], prob = 0.95)[2]
+        }
+      }
+      if(i == 466){
+        post <- mvrnorm(n = 1000, mu = fixef(mbt), Sigma = vcov(mbt))
+        
+        save_bi$ci_lo[i] <- HPDI(post[, 2], prob = 0.95)[1]
+        save_bi$ci_hi[i] <- HPDI(post[, 2], prob = 0.95)[2]
+        save_bp$ci_lo[i] <- HPDI(post[, 2] + post[, 4], prob = 0.95)[1]
+        save_bp$ci_hi[i] <- HPDI(post[, 2] + post[, 4], prob = 0.95)[2]
+      }
+      
+    }
+    
+    for(i in 1:(nrow(save_bi) - 1)){
+      ssu <- str_split(save_bi$pred[i], "_")[[1]]
+      save_bi$start_day[i] <- as.numeric(ssu[2])
+      save_bi$period_len[i] <- as.numeric(ssu[3])
+      
+      ssup <- str_split(save_bp$pred[i], "_")[[1]]
+      save_bp$start_day[i] <- as.numeric(ssup[2])
+      save_bp$period_len[i] <- as.numeric(ssup[3])
+    }
+    
+      save_bi$start_day[466] <- 0
+      save_bi$period_len[466] <- 1
+      save_bp$start_day[466] <- 0
+      save_bp$period_len[466] <- 1
+    
+      save_bi7 <- subset(save_bi, save_bi$start_day < 8)
+      save_bp7 <- subset(save_bp, save_bp$start_day < 8)
+p1 <- ggplot(data = save_bi7, mapping = aes(x = start_day * -1, y = period_len, fill = pred_est)) +
+      geom_tile() + 
+      scale_fill_gradient2(low = "#542788", high = "#b35806", mid = "#f7f7f7", midpoint = 0,
+                           na.value = rgb(211, 211, 211, max = 255, alpha = 0, names = "clear"),
+                           limits = c(min(c(save_bi7$pred_est, save_bp7$pred_est)), max(c(save_bi7$pred_est, save_bp7$pred_est)))) +
+      theme_bw() +
+      theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), 
+            axis.text = element_text(size = 12), axis.title = element_text(size = 12)) +
+      theme(legend.position = c(0.85, 0.7)) +
+      labs(fill = "Coefficient \n estimate") +
+      xlab("Days before capture") +
+      ylab("Number of days averaged \n") +
+      ggtitle("Incubation: baseline corticosterone") +
+      annotate(geom = "text", x = -Inf, y = Inf, hjust = -.5, vjust = 1.5, label = "A", size = 6) +
+      coord_cartesian(ylim = c(0.5, 8), xlim = c(-7.5, 0.5))
+    
+p2 <- ggplot(data = save_bp7, mapping = aes(x = start_day * -1, y = period_len, fill = pred_est)) +
+      geom_tile() + 
+      scale_fill_gradient2(low = "#542788", high = "#b35806", mid = "#f7f7f7", midpoint = 0,
+                           na.value = rgb(211, 211, 211, max = 255, alpha = 0, names = "clear"),
+                           limits = c(min(c(save_bi7$pred_est, save_bp7$pred_est)), max(c(save_bi7$pred_est, save_bp7$pred_est)))) +
+      theme_bw() +
+      theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), 
+            axis.text = element_text(size = 12), axis.title = element_text(size = 12)) +
+      theme(legend.position = c(0.85, 0.7)) +
+      labs(fill = "Coefficient \n estimate") +
+      xlab("Days before capture") +
+      ylab("Number of days averaged \n") +
+      ggtitle("Provisioning: baseline corticosterone") +
+      annotate(geom = "text", x = -Inf, y = Inf, hjust = -.5, vjust = 1.5, label = "B", size = 6) +
+      coord_cartesian(ylim = c(0.5, 8), xlim = c(-7.5, 0.5))
+
+# do the single line coefficients
+    save_bi2 <- subset(save_bi, save_bi$start_day == save_bi$period_len | save_bi$start_day == 0)
+    save_bp2 <- subset(save_bp, save_bp$start_day == save_bp$period_len | save_bp$start_day == 0)
+    save_bi2 <- subset(save_bi2, save_bi2$start_day < 8)
+    save_bp2 <- subset(save_bp2, save_bp2$start_day < 8)
+    
+p3 <- ggplot(data = save_bi2, mapping = aes(x = start_day * -1, y = pred_est, fill = pred_est)) +
+      geom_hline(yintercept = 0, linetype = "dashed") + 
+      scale_fill_gradient2(low = "#542788", high = "#b35806", mid = "#f7f7f7", midpoint = 0,
+                           na.value = rgb(211, 211, 211, max = 255, alpha = 0, names = "clear"),
+                           limits = c(min(c(save_bi7$pred_est, save_bp7$pred_est)), max(c(save_bi7$pred_est, save_bp7$pred_est)))) + 
+      geom_line(lwd = 1, color = "gray50") +
+      theme_bw() +
+      theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), 
+            axis.text = element_text(size = 12), axis.title = element_text(size = 12)) +
+      xlab("Days before capture") +
+      ylab("Coefficient estimate") +
+      annotate(geom = "text", x = -Inf, y = Inf, hjust = -.5, vjust = 1.5, label = "C", size = 6) +
+      #geom_line(data = save_bp2, lwd = 1.5, color = "slateblue") +
+      coord_cartesian(ylim = c(-0.3, 0.25), xlim = c(-7.5, 0.5)) +
+      #annotate(geom = "text", x = -0.6, y = 0.18, label = "Colder = \n lower cort") +
+      #annotate(geom = "text", x = -0.6, y = -0.27, label = "Colder = \n higher cort") +
+      #geom_ribbon(mapping = aes(ymin = ci_lo, ymax = ci_hi), fill = "coral3", alpha = 0.4) +
+      scale_x_continuous(breaks = seq(-10, 2, 2)) +
+      geom_segment(aes(x = start_day * -1, xend = start_day * -1, y = ci_lo, yend = ci_hi), size = 1) +
+      geom_point(size = 3, shape = 21, color = "black") +
+      guides(fill = "none")
+
+p4 <- ggplot(data = save_bp2, mapping = aes(x = start_day * -1, y = pred_est, fill = pred_est)) +
+      geom_hline(yintercept = 0, linetype = "dashed") +
+      geom_line(lwd = 1, color = "gray50") + 
+      scale_fill_gradient2(low = "#542788", high = "#b35806", mid = "#f7f7f7", midpoint = 0,
+                           na.value = rgb(211, 211, 211, max = 255, alpha = 0, names = "clear"),
+                           limits = c(min(c(save_bi7$pred_est, save_bp7$pred_est)), max(c(save_bi7$pred_est, save_bp7$pred_est)))) +
+      theme_bw() +
+      theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), 
+            axis.text = element_text(size = 12), axis.title = element_text(size = 12)) +
+      xlab("Days before capture") +
+      ylab("Coefficient estimate") +
+      annotate(geom = "text", x = -Inf, y = Inf, hjust = -.5, vjust = 1.5, label = "D", size = 6) +
+      coord_cartesian(ylim = c(-0.3, 0.25), xlim = c(-7.5, 0.5)) +
+      #annotate(geom = "text", x = -0.6, y = 0.18, label = "Colder = \n lower cort") +
+      #annotate(geom = "text", x = -0.6, y = -0.27, label = "Colder = \n higher cort") +
+      #geom_ribbon(mapping = aes(ymin = ci_lo, ymax = ci_hi), fill = "coral3", alpha = 0.4) +
+      scale_x_continuous(breaks = seq(-10, 2, 2)) +
+      geom_segment(aes(x = start_day * -1, xend = start_day * -1, y = ci_lo, yend = ci_hi), size = 1) +
+      geom_point(size = 3, color = "black", shape = 21) +
+      guides(fill = "none")
+
+ggpubr::ggarrange(p3, p4)
+
+## alternative with coefficients in teh same panel
+  save_bi2$stage <- "incubation"
+  save_bi2$color <- "#009E73"
+  save_bi2$start_day2 <- save_bi2$start_day - 0.1
+  save_bp2$stage <- "provisioning"
+  save_bp2$color <- "#CC79A7"
+  save_bp2$start_day2 <- save_bp2$start_day + 0.1
+  save_base <- rbind(save_bi2, save_bp2)
+  
+p_base <-  ggplot(data = save_base, mapping = aes(x = start_day2 * -1, y = pred_est, color = stage)) +
+  annotate(geom = "rect", xmin = -0.25, xmax = 0.25, ymin = -0.35, ymax = 0.35, fill = "gray75",
+             color = NA, alpha = 0.6) +
+  ggtitle("Baseline") +
+    geom_hline(yintercept = 0, linetype = "dashed") +
+    #geom_line(lwd = 1) +
+    theme_bw() +
+    theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), 
+            axis.text = element_text(size = 14), axis.title = element_text(size = 14)) +
+      xlab("Days before capture") +
+      ylab("Coefficient estimate") +
+      annotate(geom = "text", x = -Inf, y = Inf, hjust = -.5, vjust = 1.5, label = "A", size = 6) +
+      coord_cartesian(ylim = c(-0.4, 0.4), xlim = c(-7.5, 0.5)) +
+    scale_x_continuous(breaks = seq(-10, 2, 2)) +
+  #scale_y_continuous(breaks = seq(-0.6, 0.6, 0.2)) +
+      geom_segment(aes(x = start_day2 * -1, xend = start_day2 * -1, y = ci_lo, yend = ci_hi), size = 1) +
+      geom_point(size = 3, fill = "white", shape = 21) +
+      guides(fill = "none") +
+    theme(legend.position = c(0.55, 0.83), legend.title = element_blank(), 
+          legend.box.background = element_rect(fill = "transparent", color = "transparent"),
+          legend.text = element_text(size = 12)) +
+    scale_color_manual(values = c("#009E5C", "#D38BB3")) #+
+    #annotate(geom = "text", x = 0, y = -0.4, label = "*", size = 14)
+
+```
+
+### 2.2 Stress-Induced Corticosterone  
+
+```{r stress-heat, fig.height = 4, fig.width = 8, warning = FALSE, message = FALSE, fig.cap = "sliding windows for stress"}
+### stresscort heatmap
+      
+    save_si <- data.frame(pred = c(lab_cols3, NA), pred_est = NA, ci_lo = NA, ci_hi = NA)  
+    save_sp <- data.frame(pred = c(lab_cols3, NA), pred_est = NA, ci_lo = NA, ci_hi = NA)
+    for(i in 1:466){
+      if(i < 466){
+        dst <- subset(stress_af, stress_af$stage == "incubation" | stress_af$stage == "provisioning")
+          dst$pred <- dst[, i + 51]
+          mst <- lmer(scale(cort2_correct) ~ scale(pred)*stage + scale(cort1_correct) + (1|band) + (1|year),
+               data = dst)
+          save_si$pred_est[i] <- fixef(mst)[2]
+          save_sp$pred_est[i] <- fixef(mst)[2] + fixef(mst)[5]
+          #print(i)
+      }
+      
+      if(i == 466){
+        dst <- subset(stress_af, stress_af$stage == "incubation" | stress_af$stage == "provisioning")
+        dst$pred <- dst$t_m_av
+        mst <- lmer(scale(cort2_correct) ~ scale(pred)*stage + scale(cort1_correct) + (1|band) + (1|year),
+             data = dst)
+        save_si$pred_est[i] <- fixef(mst)[2]
+        save_sp$pred_est[i] <- fixef(mst)[2] + fixef(mst)[5]
+        #print(i)
+      }
+          
+      if(i < 466){
+        if(str_split(lab_cols3[i], "_")[[1]][2] == str_split(lab_cols3[i], "_")[[1]][3]){
+        post <- mvrnorm(n = 1000, mu = fixef(mst), Sigma = vcov(mst))
+        
+        save_si$ci_lo[i] <- HPDI(post[, 2], prob = 0.95)[1]
+        save_si$ci_hi[i] <- HPDI(post[, 2], prob = 0.95)[2]
+        save_sp$ci_lo[i] <- HPDI(post[, 2] + post[, 5], prob = 0.95)[1]
+        save_sp$ci_hi[i] <- HPDI(post[, 2] + post[, 5], prob = 0.95)[2]
+        }
+      }
+      if(i == 466){
+        post <- mvrnorm(n = 1000, mu = fixef(mst), Sigma = vcov(mst))
+        
+        save_si$ci_lo[i] <- HPDI(post[, 2], prob = 0.95)[1]
+        save_si$ci_hi[i] <- HPDI(post[, 2], prob = 0.95)[2]
+        save_sp$ci_lo[i] <- HPDI(post[, 2] + post[, 5], prob = 0.95)[1]
+        save_sp$ci_hi[i] <- HPDI(post[, 2] + post[, 5], prob = 0.95)[2]
+      }
+        
+      
+    }
+    
+    for(i in 1:nrow(save_si)){
+      ssu <- str_split(save_si$pred[i], "_")[[1]]
+      save_si$start_day[i] <- as.numeric(ssu[2])
+      save_si$period_len[i] <- as.numeric(ssu[3])
+      
+      ssup <- str_split(save_sp$pred[i], "_")[[1]]
+      save_sp$start_day[i] <- as.numeric(ssup[2])
+      save_sp$period_len[i] <- as.numeric(ssup[3])
+    }
+    
+      save_si$start_day[466] <- 0
+      save_si$period_len[466] <- 1
+      save_sp$start_day[466] <- 0
+      save_sp$period_len[466] <- 1
+    
+      save_si7 <- subset(save_si, save_si$start_day < 8)
+      save_sp7 <- subset(save_sp, save_sp$start_day < 8)
+p1s <- ggplot(data = save_si7, mapping = aes(x = start_day * -1, y = period_len, fill = pred_est)) +
+      geom_tile() + 
+      scale_fill_gradient2(low = "#542788", high = "#b35806", mid = "#f7f7f7", midpoint = 0,
+                           na.value = rgb(211, 211, 211, max = 255, alpha = 0, names = "clear"),
+                           limits = c(min(c(save_si7$pred_est, save_sp7$pred_est)), max(c(save_si7$pred_est, save_sp7$pred_est)))) +
+      theme_bw() +
+      theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), 
+            axis.text = element_text(size = 12), axis.title = element_text(size = 12)) +
+      theme(legend.position = c(0.85, 0.7)) +
+      labs(fill = "Coefficient \n estimate") +
+      xlab("Days before capture") +
+      ylab("Number of days averaged \n") +
+      ggtitle("Incubation: induced corticosterone") +
+      annotate(geom = "text", x = -Inf, y = Inf, hjust = -.5, vjust = 1.5, label = "A", size = 6) +
+      coord_cartesian(ylim = c(0.5, 8), xlim = c(-7.5, 0.5))
+    
+    
+p2s <- ggplot(data = save_sp7, mapping = aes(x = start_day * -1, y = period_len, fill = pred_est)) +
+      geom_tile() + 
+      scale_fill_gradient2(low = "#542788", high = "#b35806", mid = "#f7f7f7", midpoint = 0,
+                           na.value = rgb(211, 211, 211, max = 255, alpha = 0, names = "clear"),
+                           limits = c(min(c(save_si7$pred_est, save_sp7$pred_est)), max(c(save_si7$pred_est, save_sp7$pred_est)))) +
+      theme_bw() +
+      theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), 
+            axis.text = element_text(size = 12), axis.title = element_text(size = 12)) +
+      theme(legend.position = c(0.85, 0.7)) +
+      labs(fill = "Coefficient \n estimate") +
+      xlab("Days before capture") +
+      ylab("Number of days averaged \n") +
+      ggtitle("Provisioning: induced corticosterone") +
+      annotate(geom = "text", x = -Inf, y = Inf, hjust = -.5, vjust = 1.5, label = "B", size = 6) +
+      coord_cartesian(ylim = c(0.5, 8), xlim = c(-7.5, 0.5))
+
+# do the single line coefficients
+    save_si2 <- subset(save_si, save_si$start_day == save_si$period_len | save_si$start_day == 0)
+    save_sp2 <- subset(save_sp, save_sp$start_day == save_sp$period_len | save_sp$start_day == 0)
+    save_si2 <- subset(save_si2, save_si2$start_day < 8)
+    save_sp2 <- subset(save_sp2, save_sp2$start_day < 8)
+    
+p3s <- ggplot(data = save_si2, mapping = aes(x = start_day * -1, y = pred_est, fill = pred_est)) +
+      geom_hline(yintercept = 0, linetype = "dashed") +
+      geom_line(lwd = 1, color = "gray50") + 
+      scale_fill_gradient2(low = "#542788", high = "#b35806", mid = "#f7f7f7", midpoint = 0,
+                           na.value = rgb(211, 211, 211, max = 255, alpha = 0, names = "clear"),
+                           limits = c(min(c(save_si7$pred_est, save_sp7$pred_est)), max(c(save_si7$pred_est, save_sp7$pred_est)))) +
+      theme_bw() +
+      theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), 
+            axis.text = element_text(size = 12), axis.title = element_text(size = 12)) +
+      xlab("Days before capture") +
+      ylab("Coefficient estimate") +
+      annotate(geom = "text", x = -Inf, y = Inf, hjust = -.5, vjust = 1.5, label = "C", size = 6) +
+      #geom_line(data = save_sp2, lwd = 1.5, color = "slateblue") +
+      coord_cartesian(xlim = c(-7.5, 0.5), ylim = c(-0.4, 0.15)) +
+      #annotate(geom = "text", x = 2, y = 0.15, label = "Warmer = \n higher cort") +
+      #annotate(geom = "text", x = 2, y = -0.08, label = "Warmer = \n lower cort") +
+      #geom_ribbon(mapping = aes(ymin = ci_lo, ymax = ci_hi), fill = "coral3", alpha = 0.4) +
+      scale_x_continuous(breaks = seq(-10, 2, 2)) +
+      geom_segment(aes(x = start_day * -1, xend = start_day * -1, y = ci_lo, yend = ci_hi), size = 1) +
+      geom_point(size = 3, color = "black", shape = 21) +
+      guides(fill = "none")
+
+p4s <- ggplot(data = save_sp2, mapping = aes(x = start_day * -1, y = pred_est, fill = pred_est)) +
+      geom_hline(yintercept = 0, linetype = "dashed") +
+      geom_line(lwd = 1, color = "gray50") + 
+      scale_fill_gradient2(low = "#542788", high = "#b35806", mid = "#f7f7f7", midpoint = 0,
+                           na.value = rgb(211, 211, 211, max = 255, alpha = 0, names = "clear"),
+                           limits = c(min(c(save_si7$pred_est, save_sp7$pred_est)), max(c(save_si7$pred_est, save_sp7$pred_est)))) +
+      theme_bw() +
+      theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), 
+            axis.text = element_text(size = 12), axis.title = element_text(size = 12)) +
+      xlab("Days before capture") +
+      ylab("Coefficient estimate") +
+      annotate(geom = "text", x = -Inf, y = Inf, hjust = -.5, vjust = 1.5, label = "D", size = 6) +
+      coord_cartesian(xlim = c(-7.5, 0.5), ylim = c(-0.4, 0.15)) +
+      #annotate(geom = "text", x = 2, y = 0.15, label = "Warmer = \n higher cort") +
+      #annotate(geom = "text", x = 2, y = -0.08, label = "Warmer = \n lower cort") +
+      #geom_ribbon(mapping = aes(ymin = ci_lo, ymax = ci_hi), fill = "coral3", alpha = 0.4) +
+      scale_x_continuous(breaks = seq(-10, 2, 2)) +
+      geom_segment(aes(x = start_day * -1, xend = start_day * -1, y = ci_lo, yend = ci_hi), size = 1) +
+      geom_point(size = 3, color = "black", shape = 21) +
+      guides(fill = "none")
+
+ggpubr::ggarrange(p3s, p4s)
+
+
+## alternative with coefficients in teh same panel
+  save_si2$stage <- "incubation"
+  save_si2$color <- "#009E73"
+  save_si2$start_day2 <- save_si2$start_day - 0.1
+  save_sp2$stage <- "provisioning"
+  save_sp2$color <- "#CC79A7"
+  save_sp2$start_day2 <- save_sp2$start_day + 0.1
+  save_stress <- rbind(save_si2, save_sp2)
+  
+p_stress <-  ggplot(data = save_stress, mapping = aes(x = start_day2 * -1, y = pred_est, color = stage)) +
+    #geom_rect(mapping = aes(xmin = -0.5, xmax = 0.5, ymin = -0.35, ymax = 0.35, fill = t), 
+    #          fill = "goldenrod", alpha = 0.2, color = NA) +
+  ggtitle("Stress-induced") +
+    annotate(geom = "rect", xmin = -3.25, xmax = -2.75, ymin = -0.35, ymax = 0.35, fill = "gray75",
+             color = NA, alpha = 0.6) +
+    geom_hline(yintercept = 0, linetype = "dashed") +
+    #geom_line(lwd = 1) +
+    theme_bw() +
+    theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), 
+            axis.text = element_text(size = 14), axis.title = element_text(size = 14)) +
+      xlab("Days before capture") +
+      ylab("Coefficient estimate") +
+      annotate(geom = "text", x = -Inf, y = Inf, hjust = -.5, vjust = 1.5, label = "B", size = 6) +
+      coord_cartesian(xlim = c(-7.5, 0.5), ylim = c(-0.4, 0.4)) +
+    scale_x_continuous(breaks = seq(-10, 2, 2)) +
+  #scale_y_continuous(breaks = seq(-0.6, 0.6, 0.2)) +
+      geom_segment(aes(x = start_day2 * -1, xend = start_day2 * -1, y = ci_lo, yend = ci_hi), size = 1) +
+      geom_point(size = 3, fill = "white", shape = 21) +
+      guides(fill = "none", color = "none") +
+    #theme(legend.position = c(0.8, 0.85), legend.title = element_blank()) +
+    scale_color_manual(values = c("#009E5C", "#D38BB3")) 
+    #annotate(geom = "text", x = -3, y = -0.4, label = "*", size = 14)
+#p_stress
+```
+
+### 2.3 Post-Dex Corticosterone
+
+```{r dex-heat, fig.height = 4, fig.width = 8, warning = FALSE, message = FALSE, fig.cap = "sliding windows for dex"}
+### stresscort heatmap
+      
+    save_di <- data.frame(pred = c(lab_cols3, NA), pred_est = NA, ci_lo = NA, ci_hi = NA)  
+    save_dp <- data.frame(pred = c(lab_cols3, NA), pred_est = NA, ci_lo = NA, ci_hi = NA)
+    for(i in 1:466){
+      if(i < 466){
+        ddt <- subset(dex_af, dex_af$stage == "incubation" | dex_af$stage == "provisioning")
+        ddt$pred <- ddt[, i + 51]
+        mdt <- lmer(scale(cort3_correct) ~ scale(pred)*stage + scale(cort2_correct) + (1|band) + (1|year),
+             data = ddt)
+        save_di$pred_est[i] <- fixef(mdt)[2]
+        save_dp$pred_est[i] <- fixef(mdt)[2] + fixef(mdt)[5]
+        #print(i)
+      }
+      if(i == 466){
+        ddt <- subset(dex_af, dex_af$stage == "incubation" | dex_af$stage == "provisioning")
+        ddt$pred <- ddt$t_m_av
+        mdt <- lmer(scale(cort3_correct) ~ scale(pred)*stage + scale(cort2_correct) + (1|band) + (1|year),
+             data = ddt)
+        save_di$pred_est[i] <- fixef(mdt)[2]
+        save_dp$pred_est[i] <- fixef(mdt)[2] + fixef(mdt)[5]
+        #print(i)
+      }
+      
+      if(i < 466){
+        if(str_split(lab_cols3[i], "_")[[1]][2] == str_split(lab_cols3[i], "_")[[1]][3]){
+        post <- mvrnorm(n = 1000, mu = fixef(mdt), Sigma = vcov(mdt))
+        
+        save_di$ci_lo[i] <- HPDI(post[, 2], prob = 0.95)[1]
+        save_di$ci_hi[i] <- HPDI(post[, 2], prob = 0.95)[2]
+        save_dp$ci_lo[i] <- HPDI(post[, 2] + post[, 5], prob = 0.95)[1]
+        save_dp$ci_hi[i] <- HPDI(post[, 2] + post[, 5], prob = 0.95)[2]
+        }
+      }
+      if(i == 466){
+        post <- mvrnorm(n = 1000, mu = fixef(mdt), Sigma = vcov(mdt))
+        
+        save_di$ci_lo[i] <- HPDI(post[, 2], prob = 0.95)[1]
+        save_di$ci_hi[i] <- HPDI(post[, 2], prob = 0.95)[2]
+        save_dp$ci_lo[i] <- HPDI(post[, 2] + post[, 5], prob = 0.95)[1]
+        save_dp$ci_hi[i] <- HPDI(post[, 2] + post[, 5], prob = 0.95)[2]
+      }  
+        
+        
+      
+    }
+    
+    for(i in 1:nrow(save_di)){
+      ssu <- str_split(save_di$pred[i], "_")[[1]]
+      save_di$start_day[i] <- as.numeric(ssu[2])
+      save_di$period_len[i] <- as.numeric(ssu[3])
+      
+      ssup <- str_split(save_dp$pred[i], "_")[[1]]
+      save_dp$start_day[i] <- as.numeric(ssup[2])
+      save_dp$period_len[i] <- as.numeric(ssup[3])
+    }
+    
+      save_di$start_day[466] <- 0
+      save_di$period_len[466] <- 1
+      save_dp$start_day[466] <- 0
+      save_dp$period_len[466] <- 1
+    
+      
+      save_di21 <- subset(save_di, save_di$start_day < 22)
+      save_dp21 <- subset(save_dp, save_dp$start_day < 22)
+p1d <- ggplot(data = save_di21, mapping = aes(x = start_day * -1, y = period_len, fill = pred_est)) +
+      geom_tile() + 
+      scale_fill_gradient2(low = "#542788", high = "#b35806", mid = "#f7f7f7", midpoint = 0,
+                           na.value = rgb(211, 211, 211, max = 255, alpha = 0, names = "clear"),
+                           limits = c(min(c(save_di21$pred_est, save_dp21$pred_est)), max(c(save_di21$pred_est, save_dp21$pred_est)))) +
+      theme_bw() +
+      theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), 
+            axis.text = element_text(size = 12), axis.title = element_text(size = 12)) +
+      theme(legend.position = c(0.85, 0.7)) +
+      labs(fill = "Coefficient \n estimate") +
+      xlab("Days before capture") +
+      ylab("Number of days averaged \n") +
+      ggtitle("Incubation: post-dex corticosterone") +
+      annotate(geom = "text", x = -Inf, y = Inf, hjust = -.5, vjust = 1.5, label = "A", size = 6) +
+      coord_cartesian(ylim = c(0.5, 23))
+    
+p2d <- ggplot(data = save_dp21, mapping = aes(x = start_day * -1, y = period_len, fill = pred_est)) +
+      geom_tile() + 
+      scale_fill_gradient2(low = "#542788", high = "#b35806", mid = "#f7f7f7", midpoint = 0,
+                           na.value = rgb(211, 211, 211, max = 255, alpha = 0, names = "clear"),
+                           limits = c(min(c(save_di21$pred_est, save_dp21$pred_est)), max(c(save_di21$pred_est, save_dp21$pred_est)))) +
+      theme_bw() +
+      theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), 
+            axis.text = element_text(size = 12), axis.title = element_text(size = 12)) +
+      theme(legend.position = c(0.85, 0.7)) +
+      labs(fill = "Coefficient \n estimate") +
+      xlab("Days before capture") +
+      ylab("Number of days averaged \n") +
+      ggtitle("Provisioning: post-dex corticosterone") +
+      annotate(geom = "text", x = -Inf, y = Inf, hjust = -.5, vjust = 1.5, label = "B", size = 6) +
+      coord_cartesian(ylim = c(0.5, 23))
+
+# do the single line coefficients
+    save_di2 <- subset(save_di, save_di$start_day == save_di$period_len | save_di$start_day == 0)
+    save_dp2 <- subset(save_dp, save_dp$start_day == save_dp$period_len | save_dp$start_day == 0)
+    save_di2 <- subset(save_di2, save_di2$start_day < 22)
+    save_dp2 <- subset(save_dp2, save_dp2$start_day < 22)
+    
+p3d <- ggplot(data = save_di2, mapping = aes(x = start_day * -1, y = pred_est, fill = pred_est)) +
+      geom_hline(yintercept = 0, linetype = "dashed") +
+      geom_line(lwd = 1, color = "gray50") + 
+      scale_fill_gradient2(low = "#542788", high = "#b35806", mid = "#f7f7f7", midpoint = 0,
+                           na.value = rgb(211, 211, 211, max = 255, alpha = 0, names = "clear"),
+                           limits = c(min(c(save_di21$pred_est, save_dp21$pred_est)), max(c(save_di21$pred_est, save_dp21$pred_est)))) +
+      theme_bw() +
+      theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), 
+            axis.text = element_text(size = 12), axis.title = element_text(size = 12)) +
+      xlab("Days before capture") +
+      ylab("Coefficient estimate") +
+      annotate(geom = "text", x = -Inf, y = Inf, hjust = -.5, vjust = 1.5, label = "C", size = 6) +
+      #geom_line(data = save_dp2, lwd = 1.5, color = "slateblue") +
+      coord_cartesian(ylim = c(-0.25, 0.35)) +
+      #annotate(geom = "text", x = 2, y = 0.15, label = "Warmer = \n higher cort") +
+      #annotate(geom = "text", x = 2, y = -0.08, label = "Warmer = \n lower cort") +
+      #geom_ribbon(mapping = aes(ymin = ci_lo, ymax = ci_hi), fill = "coral3", alpha = 0.4) +
+      scale_x_continuous(breaks = seq(-30, 5, 5)) +
+      geom_segment(aes(x = start_day * -1, xend = start_day * -1, y = ci_lo, yend = ci_hi), size = 1) +
+      geom_point(size = 3, color = "black", shape = 21) +
+      guides(fill = "none")
+
+p4d <- ggplot(data = save_dp2, mapping = aes(x = start_day * -1, y = pred_est, fill = pred_est)) +
+      geom_hline(yintercept = 0, linetype = "dashed") +
+      geom_line(lwd = 1, color = "gray50") + 
+      scale_fill_gradient2(low = "#542788", high = "#b35806", mid = "#f7f7f7", midpoint = 0,
+                           na.value = rgb(211, 211, 211, max = 255, alpha = 0, names = "clear"),
+                           limits = c(min(c(save_di21$pred_est, save_dp21$pred_est)), max(c(save_di21$pred_est, save_dp21$pred_est)))) +
+      theme_bw() +
+      theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), 
+            axis.text = element_text(size = 12), axis.title = element_text(size = 12)) +
+      xlab("Days before capture") +
+      ylab("Coefficient estimate") +
+      annotate(geom = "text", x = -Inf, y = Inf, hjust = -.5, vjust = 1.5, label = "D", size = 6) +
+      coord_cartesian(ylim = c(-0.25, 0.35)) +
+      #annotate(geom = "text", x = 2, y = 0.15, label = "Warmer = \n higher cort") +
+      #annotate(geom = "text", x = 2, y = -0.08, label = "Warmer = \n lower cort") +
+      #geom_ribbon(mapping = aes(ymin = ci_lo, ymax = ci_hi), fill = "coral3", alpha = 0.4) +
+      scale_x_continuous(breaks = seq(-30, 5, 5)) +
+      geom_segment(aes(x = start_day * -1, xend = start_day * -1, y = ci_lo, yend = ci_hi), size = 1) +
+      geom_point(size = 3, color = "black", shape = 21) +
+      guides(fill = "none")
+
+ggpubr::ggarrange(p3d, p4d)
+
+## alternative with coefficients in teh same panel
+  save_di2$stage <- "incubation"
+  save_di2$color <- "#009E73"
+  save_di2$start_day2 <- save_di2$start_day - 0.2
+  save_dp2$stage <- "provisioning"
+  save_dp2$color <- "#CC79A7"
+  save_dp2$start_day2 <- save_dp2$start_day + 0.2
+  save_dex <- rbind(save_di2, save_dp2)
+  
+p_dex <-  ggplot(data = save_dex, mapping = aes(x = start_day2 * -1, y = pred_est, color = stage)) +
+  annotate(geom = "rect", xmin = -0.3, xmax = 0.3, ymin = -0.35, ymax = 0.35, fill = "gray75",
+             color = NA, alpha = 0.6) +
+  ggtitle("Post-dexamethasone") +
+    geom_hline(yintercept = 0, linetype = "dashed") +
+    #geom_line(lwd = 1) +
+    theme_bw() +
+    theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), 
+            axis.text = element_text(size = 14), axis.title = element_text(size = 14)) +
+      xlab("Days before capture") +
+      ylab("Coefficient estimate") +
+      annotate(geom = "text", x = -Inf, y = Inf, hjust = -.5, vjust = 1.5, label = "C", size = 6) +
+      coord_cartesian(ylim = c(-0.4, 0.4)) +
+    scale_x_continuous(breaks = seq(-30, 5, 5)) +
+  #scale_y_continuous(breaks = seq(-0.6, 0.6, 0.2)) +
+      geom_segment(aes(x = start_day2 * -1, xend = start_day2 * -1, y = ci_lo, yend = ci_hi), size = 1) +
+      geom_point(size = 3, fill = "white", shape = 21) +
+      guides(fill = "none", color = "none") +
+    #theme(legend.position = c(0.8, 0.85), legend.title = element_blank()) +
+    scale_color_manual(values = c("#009E5C", "#D38BB3")) #+
+    #annotate(geom = "text", x = 0, y = -0.4, label = "*", size = 14)
+#p_dex
+```
+
+### 2.4 Combined plot
+
+This is the same as the panels above but put together into the version included with the paper.
+
+```{r echo = FALSE, warning = FALSE, message = FALSE, fig.width = 9.5, fig.height = 3.15}
+ggpubr::ggarrange(p_base, p_stress, p_dex, nrow = 1)
+```
+
+
+## 3. Is variation in corticosterone best predicted by absolute temperature or a prediction error?
+
+Using AIC to compare models that have either absolute temperature or prediction error (real vs. expected temp based on date). See text for description. For each model set I am printing the AIC table and the details for best supported model(s).
+
+### 3.1 Base Corticosterone
+
+```{r base-mods, echo = FALSE, warning = FALSE, message = FALSE}
+## cut dataframes down to the columns needed for our models. Then add in expected temperature to frame
+  base_af_comp <- base_af[, c("band", "year", "stage", "cort1_correct", "cap_doy")]
+  base_af_comp$temperature <- base_af$t_m_av    # this is actual temperature
+  base_af_comp$offset <- base_af_ex$t_m_av      # this is offset from predicted
+  base_af_comp$t_dbefore <- base_af$t_db_av     # this is temperature the day before
+  base_af_comp <- subset(base_af_comp, base_af_comp$stage == "incubation" | base_af_comp$stage == "provisioning")
+  base_af_comp <- na.omit(base_af_comp)         # remove any missing values for AIC comparison
+  #base_af_comp$cort1_correct <- log(base_af_comp$cort1_correct)
+  
+  base_af_comp$temperature <- scale(base_af_comp$temperature)
+  base_af_comp$t_dbefore <- scale(base_af_comp$t_dbefore)
+  base_af_comp$cap_doy <- scale(base_af_comp$cap_doy)
+  base_af_comp$offset <- scale(base_af_comp$offset)
+
+## candidate models
+  b_temp <- lmer(cort1_correct ~ temperature + cap_doy + (1|year) + (1|band), data = base_af_comp)
+  b_temp_stg <- lmer(cort1_correct ~ temperature * stage + cap_doy + (1|year) + (1|band), data = base_af_comp)
+  b_offs <- lmer(cort1_correct ~ offset + (1|year) + cap_doy + (1|band), data = base_af_comp)
+  b_offs_stg <- lmer(cort1_correct ~ offset * stage + cap_doy + (1|year) + (1|band), data = base_af_comp)
+  b_temp_offs <- lmer(cort1_correct ~ temperature + offset + cap_doy + (1|year) + (1|band), data = base_af_comp)
+  b_temp_offs_stg <- lmer(cort1_correct ~ temperature * stage + offset * stage + cap_doy + (1|year) + (1|band), data = base_af_comp)
+  b_temp_db <- lmer(cort1_correct ~ temperature * t_dbefore + cap_doy + (1|year) + (1|band), data = base_af_comp)
+  b_temp_stg_db <- lmer(cort1_correct ~ temperature * t_dbefore * stage + cap_doy + (1|year) + (1|band), data = base_af_comp)
+  b_null <- lmer(cort1_correct ~ stage + cap_doy + (1|year) + (1|band), data = base_af_comp)
+  
+  bm_sel <- model.sel(b_temp, b_temp_stg, b_offs, b_offs_stg, b_temp_db, b_temp_stg_db, b_null)
+  #bm_sel <- model.sel(b_temp, b_temp_stg, b_offs, b_offs_stg, b_null)
+  bm_sel <- as.data.frame(bm_sel)[13:17]
+  bm_sel[, 2:3] <- round(bm_sel[, 2:3], 2)
+  bm_sel[, 4:5] <- round(bm_sel[, 4:5], 3)
+  print(bm_sel)
+  
+## candidate models
+  bs_temp <- lmer(cort1_correct ~ temperature + I(temperature^2) + I(temperature^3) + cap_doy + (1|year) + (1|band), data = base_af_comp)
+  bs_temp_stg <- lmer(cort1_correct ~ temperature * stage + I(temperature^2)*stage + I(temperature^3)*stage + cap_doy + (1|year) + (1|band), data = base_af_comp)
+  bs_offs <- lmer(cort1_correct ~ offset + I(offset^2) + I(offset^3) + (1|year) + cap_doy + (1|band), data = base_af_comp)
+  bs_offs_stg <- lmer(cort1_correct ~ offset * stage + I(offset^2)*stage + I(offset^3)*stage + cap_doy + (1|year) + (1|band), data = base_af_comp)
+  #bs_temp_offs <- lmer(cort1_correct ~ poly(temperature, 3) + poly(offset, 3) + cap_doy + (1|year) + (1|band), data = base_af_comp)
+  #bs_temp_offs_stg <- lmer(cort1_correct ~ poly(temperature, 3) * stage + poly(offset, 3) * stage + cap_doy + (1|year) + (1|band), data = base_af_comp)
+  bs_null <- lmer(cort1_correct ~ stage + cap_doy + (1|year) + (1|band), data = base_af_comp)
+  
+  #model.sel(bs_temp, bs_temp_stg, bs_offs, bs_offs_stg, b_null)
+  
+  #model.sel(b_temp, b_temp_stg, b_offs, b_offs_stg, b_temp_offs, b_temp_offs_stg, b_null, 
+  #          bs_temp, bs_temp_stg, bs_offs, bs_offs_stg, bs_temp_offs, bs_temp_offs_stg)
+  
+  #tab_model(b_temp_stg)
+  tab_model(b_temp_stg)
+  
+```
+
+
+```{r base-mod-check, echo = FALSE, message = FALSE, warning = FALSE}
+#plot(simulateResiduals(b_temp_stg))
+
+#plot(simulateResiduals(b_temp_stg))
+```
+
+
+
+### 3.2 Stress Cort
+
+
+```{r stress-mods, echo = FALSE, warning = FALSE, message = FALSE}
+## cut dataframes down to the columns needed for our models. Then add in expected temperature to frame
+  stress_af_comp <- stress_af[, c("band", "year", "stage", "cort1_correct", "cort2_correct", "cap_doy")]
+  stress_af_comp$temperature <- stress_af$tb_2_2    # this is actual temperature
+  stress_af_comp$temp_morn_av <- stress_af$t_m_av
+  stress_af_comp$temp_dbefore <- stress_af$t_db_av
+  stress_af_comp$offset <- stress_af_ex$tb_2_2      # this is offset from predicted
+  stress_af_comp <- subset(stress_af_comp, stress_af_comp$stage == "incubation" | stress_af_comp$stage == "provisioning")
+  stress_af_comp <- na.omit(stress_af_comp)         # remove any missing values for AIC comparison
+  #stress_af_comp$cort1_correct <- log(stress_af_comp$cort1_correct)
+  #stress_af_comp$cort2_correct <- log(stress_af_comp$cort2_correct)
+  
+  stress_af_comp$temperature <- scale(stress_af_comp$temperature)
+  stress_af_comp$temp_morn_av <- scale(stress_af_comp$temp_morn_av)
+  stress_af_comp$temp_dbefore <- scale(stress_af_comp$temp_dbefore)
+  stress_af_comp$cap_doy <- scale(stress_af_comp$cap_doy)
+  stress_af_comp$offset <- scale(stress_af_comp$offset)
+  stress_af_comp$cort1_correct <- scale(stress_af_comp$cort1_correct)
+
+## candidate models
+  s_temp <- lmer(cort2_correct ~ temperature + cap_doy + cort1_correct + (1|year) + (1|band), data = stress_af_comp)
+  s_temp_stg <- lmer(cort2_correct ~ temperature * stage + cap_doy + cort1_correct + (1|year) + (1|band), data = stress_af_comp)
+  s_offs <- lmer(cort2_correct ~ offset + (1|year) + cap_doy + cort1_correct + (1|band), data = stress_af_comp)
+  s_offs_stg <- lmer(cort2_correct ~ offset * stage + cap_doy + cort1_correct + (1|year) + (1|band), data = stress_af_comp)
+  s_temp_offs <- lmer(cort2_correct ~ temperature + offset + cap_doy + cort1_correct + (1|year) + (1|band), data = stress_af_comp)
+  s_temp_offs_stg <- lmer(cort2_correct ~ temperature * stage + offset * stage + cap_doy + cort1_correct + (1|year) + (1|band), data = stress_af_comp)
+  s_temp_db <- lmer(cort2_correct ~ temp_morn_av * temp_dbefore + cap_doy + cort1_correct + (1|year) + (1|band), data = stress_af_comp)
+  s_temp_stg_db <- lmer(cort2_correct ~ temp_morn_av * temp_dbefore * stage + cap_doy + cort1_correct + (1|year) + (1|band), data = stress_af_comp)
+  s_null <- lmer(cort2_correct ~ stage + cap_doy + cort1_correct + (1|year) + (1|band), data = stress_af_comp)
+  
+  sm_sel <- model.sel(s_temp, s_temp_stg, s_offs, s_offs_stg, s_temp_db, s_temp_stg_db, s_null)
+  sm_sel <- as.data.frame(sm_sel)[16:20]
+  sm_sel[, 2:3] <- round(sm_sel[, 2:3], 2)
+  sm_sel[, 4:5] <- round(sm_sel[, 4:5], 3)
+  print(sm_sel)
+  
+## candidate models
+  ss_temp <- lmer(cort2_correct ~ temperature + I(temperature^2) + I(temperature^3) + cap_doy + cort1_correct + (1|year) + (1|band), data = stress_af_comp)
+  ss_temp_stg <- lmer(cort2_correct ~ temperature * stage + I(temperature^2) * stage + I(temperature^3) * stage + cap_doy + cort1_correct + (1|year) + (1|band), data = stress_af_comp)
+  ss_offs <- lmer(cort2_correct ~ offset + I(offset^2) + I(offset^3) + (1|year) + cap_doy + cort1_correct + (1|band), data = stress_af_comp)
+  ss_offs_stg <- lmer(cort2_correct ~ offset * stage + I(offset^2) * stage + I(offset^3) * stage + cap_doy + cort1_correct + (1|year) + (1|band), data = stress_af_comp)
+  #ss_temp_offs <- lmer(cort2_correct ~ poly(temperature, 3) + poly(offset, 3) + cap_doy + cort1_correct + (1|year) + (1|band), data = stress_af_comp)
+  #ss_temp_offs_stg <- lmer(cort2_correct ~ poly(temperature, 3) * stage + poly(offset, 3) * stage + cap_doy + cort1_correct + (1|year) + (1|band), data = stress_af_comp)
+  ss_null <- lmer(cort2_correct ~ stage + cap_doy + cort1_correct + (1|year) + (1|band), data = stress_af_comp)
+  
+  #model.sel(ss_temp, ss_temp_stg, ss_offs, ss_offs_stg, s_null)
+  
+  #model.sel(s_temp, s_temp_stg, s_offs, s_offs_stg, s_temp_offs, s_temp_offs_stg, s_null, 
+  #          ss_temp, ss_temp_stg, ss_offs, ss_offs_stg, ss_temp_offs, ss_temp_offs_stg)
+  
+  #tab_model(s_temp_offs_stg)
+  tab_model(s_temp_stg)
+  
+```
+
+
+```{r str-mod-check, echo = FALSE, message = FALSE, warning = FALSE}
+#plot(simulateResiduals(s_temp_offs_stg))
+
+#plot(simulateResiduals(s_temp_stg))
+```
+
+### 3.3 Dex Cort
+
+
+
+```{r dex-mods, echo = FALSE, warning = FALSE, message = FALSE}
+## cut dataframes down to the columns needed for our models. Then add in expected temperature to frame
+  dex_af_comp <- dex_af[, c("band", "year", "stage", "cort3_correct", "cort2_correct", "cap_doy")]
+  dex_af_comp$temperature <- dex_af$t_m_av    # this is actual temperature
+  dex_af_comp$t_dbefore <- dex_af$t_db_av
+  dex_af_comp$offset <- dex_af_ex$t_m_av      # this is offset from predicted
+  dex_af_comp <- subset(dex_af_comp, dex_af_comp$stage == "incubation" | dex_af_comp$stage == "provisioning")
+  dex_af_comp <- na.omit(dex_af_comp)         # remove any missing values for AIC comparison
+  #dex_af_comp$cort2_correct <- log(dex_af_comp$cort2_correct)
+  #dex_af_comp$cort3_correct <- log(dex_af_comp$cort3_correct)
+  dex_af_comp$temperature <- scale(dex_af_comp$temperature)
+  dex_af_comp$t_dbefore <- scale(dex_af_comp$t_dbefore)
+  dex_af_comp$cap_doy <- scale(dex_af_comp$cap_doy)
+  dex_af_comp$offset <- scale(dex_af_comp$offset)
+  dex_af_comp$cort2_correct <- scale(dex_af_comp$cort2_correct)
+
+## candidate models
+  d_temp <- lmer(cort3_correct ~ temperature + cap_doy + cort2_correct + (1|year) + (1|band), data = dex_af_comp)
+  d_temp_stg <- lmer(cort3_correct ~ temperature * stage + cap_doy + cort2_correct + (1|year) + (1|band), data = dex_af_comp)
+  d_offs <- lmer(cort3_correct ~ offset + (1|year) + cap_doy + cort2_correct + (1|band), data = dex_af_comp)
+  d_offs_stg <- lmer(cort3_correct ~ offset * stage + cap_doy + cort2_correct + (1|year) + (1|band), data = dex_af_comp)
+  d_temp_offs <- lmer(cort3_correct ~ temperature + offset + cap_doy + cort2_correct + (1|year) + (1|band), data = dex_af_comp)
+  d_temp_offs_stg <- lmer(cort3_correct ~ temperature * stage + offset * stage + cap_doy + cort2_correct + (1|year) + (1|band), data = dex_af_comp)
+  d_temp_db <- lmer(cort3_correct ~ temperature * t_dbefore + cap_doy + cort2_correct + (1|year) + (1|band), data = dex_af_comp)
+  d_temp_stg_db <- lmer(cort3_correct ~ temperature * t_dbefore * stage + cap_doy + cort2_correct + (1|year) + (1|band), data = dex_af_comp)
+  d_null <- lmer(cort3_correct ~ stage + cap_doy + cort2_correct + (1|year) + (1|band), data = dex_af_comp)
+  
+  dm_sel <- model.sel(d_temp, d_temp_stg, d_offs, d_offs_stg, d_temp_db, d_temp_stg_db, d_null)
+  dm_sel <- as.data.frame(dm_sel)[14:18]
+  dm_sel[, 2:3] <- round(dm_sel[, 2:3], 2)
+  dm_sel[, 4:5] <- round(dm_sel[, 4:5], 3)
+  print(dm_sel)
+  
+## candidate models
+  ds_temp <- lmer(cort3_correct ~ temperature + I(temperature^2) + I(temperature^3) + cap_doy + cort2_correct + (1|year) + (1|band), data = dex_af_comp)
+  ds_temp_stg <- lmer(cort3_correct ~ temperature * stage + I(temperature^2) * stage + I(temperature^3) * stage + cap_doy + cort2_correct + (1|year) + (1|band), data = dex_af_comp)
+  ds_offs <- lmer(cort3_correct ~ offset + I(offset^2) + I(offset^3) + (1|year) + cap_doy + cort2_correct + (1|band), data = dex_af_comp)
+  ds_offs_stg <- lmer(cort3_correct ~ offset * stage + I(offset^2) * stage + I(offset^3) * stage + cap_doy + cort2_correct + (1|year) + (1|band), data = dex_af_comp)
+  #ds_temp_offs <- lmer(cort3_correct ~ poly(temperature, 3) + poly(offset, 3) + cap_doy + cort2_correct + (1|year) + (1|band), data = dex_af_comp)
+  #ds_temp_offs_stg <- lmer(cort3_correct ~ poly(temperature, 3) * stage + poly(offset, 3) * stage + cap_doy + cort2_correct + (1|year) + (1|band), data = dex_af_comp)
+  ds_null <- lmer(cort3_correct ~ stage + cap_doy + cort2_correct + (1|year) + (1|band), data = dex_af_comp)
+  
+  #model.sel(ds_temp, ds_temp_stg, ds_offs, ds_offs_stg, d_null)
+
+  
+  #model.sel(d_temp, d_temp_stg, d_offs, d_offs_stg, d_temp_offs, d_temp_offs_stg, d_null, 
+  #          ds_temp, ds_temp_stg, ds_offs, ds_offs_stg, ds_temp_offs, ds_temp_offs_stg)
+  
+  tab_model(d_null)
+  #tab_model(d_temp_stg)
+  
+```
+
+
+```{r dex-mod-check, echo = FALSE, message = FALSE, warning = FALSE}
+#plot(simulateResiduals(d_null))
+
+#plot(simulateResiduals(d_temp_stg))
+#plot(simulateResiduals(d_null))
+```
+
+
+
+
+## 4. Plots from best models
+
+### 4.1 Baseline plot
+
+For these plots I am taking the best model from the section above and calculating the mean and confidence interval from the table of coefficients separately for incubation and provisioning. I do this by taking 10000 samples from the posterior distribution and calculating CIs at each point then plotting. Models are fit on log scale and all CIs/means are also calculated on that scale, but for plotting I back-transform to the measurement scale to make it easier to interpret. Full details on the models themselves are given in the tables above.
+
+```{r base-plot, warning = FALSE, message = FALSE, fig.width = 5, fig.height = 5}
+
+postb <- mvrnorm(n = 10000, mu = fixef(b_temp_stg), Sigma = vcov(b_temp_stg))
+rtb <- seq(min(base_af_comp$temperature), max(base_af_comp$temperature), length.out = 100)
+
+b_mu_inc <- exp(sapply(rtb, function(z)mean(postb[, 1] + postb[, 2]*z)))
+b_ci_inc <- exp(sapply(rtb, function(z)HPDI(postb[, 1] + postb[, 2]*z)))
+
+b_mu_pro <- exp(sapply(rtb, function(z)mean(postb[, 1] + postb[, 2]*z + postb[, 3] + postb[, 5]*z)))
+b_ci_pro <- exp(sapply(rtb, function(z)HPDI(postb[, 1] + postb[, 2]*z + postb[, 3] + postb[, 5]*z)))
+
+rtb2 <- (rtb * sd(na.omit(base_af$t_m_av))) + mean(na.omit(base_af$t_m_av))
+
+b_mu <- data.frame(temp = rtb2, mu_inc = b_mu_inc, mu_pro = b_mu_pro)
+b_ci <- data.frame(temp = rtb2, cil_inc = b_ci_inc[1,], cih_inc = b_ci_inc[2,], cil_pro = b_ci_pro[1,], cih_pro = b_ci_pro[2,])
+
+
+p2_base <- ggplot(data = base_af_comp, mapping = aes(x = (temperature * sd(na.omit(base_af$t_m_av))) + mean(na.omit(base_af$t_m_av)), 
+                                            y = exp(cort1_correct), fill = stage)) +
+  geom_point(alpha = 0.5, shape = 21) +
+  scale_fill_manual(values = c("#009E5C", "#D38BB3")) +
+  geom_line(data = b_mu, mapping = aes(x = temp, y = mu_inc), inherit.aes = FALSE, color = "#009E5C", size = 1.5, alpha = 0.9) +
+  geom_line(data = b_mu, mapping = aes(x = temp, y = mu_pro), inherit.aes = FALSE, color = "#D38BB3", size = 1.5, alpha = 0.9) +
+  geom_ribbon(data = b_ci, mapping = aes(x = temp, ymin = cil_inc, ymax = cih_inc), inherit.aes = FALSE, fill = "#009E5C", alpha = 0.3) +
+  geom_ribbon(data = b_ci, mapping = aes(x = temp, ymin = cil_pro, ymax = cih_pro), inherit.aes = FALSE, fill = "#D38BB3", alpha = 0.3) +
+  theme_bw() +
+  annotate(geom = "text", x = -Inf, y = Inf, hjust = -.5, vjust = 1.5, label = "A", size = 6) +
+  coord_cartesian(ylim = c(0, 15)) +
+  theme(legend.position = c(0.81, 0.91), panel.grid.minor = element_blank(), panel.grid.major = element_blank(), 
+        axis.title = element_text(size = 16), legend.title = element_blank(), axis.text = element_text(size = 14),
+        legend.text = element_text(size = 14)) +
+  guides(fill = guide_legend(override.aes = list(size = 4))) +
+  ylab("Baseline corticosterone (ng/ml)") +
+  xlab("Temperature \u00b0C") 
+p2_base
+
+
+```
+
+Note that in this plot I've clipped the y axis to 20 to make the trend visible at all. This means 34 data points (out of 1428) are not plotted.
+
+### 4.2 Stress induced plot
+
+Exact same approach as described for baseline plot above.
+
+```{r stress-plot, warning = FALSE, message = FALSE, fig.width = 5, fig.height = 5}
+
+posts <- mvrnorm(n = 10000, mu = fixef(s_temp_stg), Sigma = vcov(s_temp_stg))
+rt <- seq(min(stress_af_comp$temperature), max(stress_af_comp$temperature), length.out = 100)
+
+s_mu_inc <- exp(sapply(rt, function(z)mean(posts[, 1] + posts[, 2]*z)))
+s_ci_inc <- exp(sapply(rt, function(z)HPDI(posts[, 1] + posts[, 2]*z)))
+
+s_mu_pro <- exp(sapply(rt, function(z)mean(posts[, 1] + posts[, 2]*z + posts[, 3] + posts[, 6]*z)))
+s_ci_pro <- exp(sapply(rt, function(z)HPDI(posts[, 1] + posts[, 2]*z + posts[, 3] + posts[, 6]*z)))
+
+rt2 <- (rt * sd(na.omit(stress_af$tb_3_3))) + mean(na.omit(stress_af$tb_3_3))
+
+s_mu <- data.frame(temp = rt2, mu_inc = s_mu_inc, mu_pro = s_mu_pro)
+s_ci <- data.frame(temp = rt2, cil_inc = s_ci_inc[1,], cih_inc = s_ci_inc[2,], cil_pro = s_ci_pro[1,], cih_pro = s_ci_pro[2,])
+
+#pred <- predict(ss_temp_stg)
+
+p2_stress <- ggplot(data = stress_af_comp, mapping = aes(x = (temperature * sd(na.omit(stress_af$tb_3_3))) + mean(na.omit(stress_af$tb_3_3)), 
+                                            y = exp(cort2_correct), fill = stage)) +
+  geom_point(alpha = 0.5, shape = 21) +
+  scale_fill_manual(values = c("#009E5C", "#D38BB3")) +
+  geom_line(data = s_mu, mapping = aes(x = temp, y = mu_inc), inherit.aes = FALSE, color = "#009E5C", size = 1.5, alpha = 0.9) +
+  geom_line(data = s_mu, mapping = aes(x = temp, y = mu_pro), inherit.aes = FALSE, color = "#D38BB3", size = 1.5, alpha = 0.9) +
+  geom_ribbon(data = s_ci, mapping = aes(x = temp, ymin = cil_inc, ymax = cih_inc), inherit.aes = FALSE, fill = "#009E5C", alpha = 0.3) +
+  geom_ribbon(data = s_ci, mapping = aes(x = temp, ymin = cil_pro, ymax = cih_pro), inherit.aes = FALSE, fill = "#D38BB3", alpha = 0.3) +
+  theme_bw() +
+  coord_cartesian(ylim = c(0, 120)) +
+  annotate(geom = "text", x = -Inf, y = Inf, hjust = -.5, vjust = 1.5, label = "B", size = 6) +
+  theme(legend.position = c(0.81, 0.91), panel.grid.minor = element_blank(), panel.grid.major = element_blank(), 
+        axis.title = element_text(size = 16), legend.title = element_blank(), axis.text = element_text(size = 14),
+        legend.text = element_text(size = 14)) +
+  guides(fill = guide_legend(override.aes = list(size = 4))) +
+  ylab("Stress-induced corticosterone (ng/ml)") +
+  xlab("Temperature \u00b0C") 
+p2_stress
+```
+
+The two panels for base and stress-induced combined into one figure for the manuscript.
+
+```{r message = FALSE, warning = FALSE, echo = FALSE, fig.height = 5, fig.width = 10}
+ggpubr::ggarrange(p2_base, p2_stress, nrow = 1)
+```
+
+
+### 4.3 Dex plot
+
+The best model is the null with no temperature effect so not plot is produced.
