@@ -6,7 +6,7 @@ Maren N. Vitousek, Jennifer L. Houtz, Monique A. Pipkin, David A. Chang van Oord
 
 # Archiving
 
-The repository is permanently archived on Zenodo: 
+The repository is permanently archived on Zenodo: [![DOI](https://zenodo.org/badge/512863639.svg)](https://zenodo.org/badge/latestdoi/512863639)
 
 # Description of contents
 
